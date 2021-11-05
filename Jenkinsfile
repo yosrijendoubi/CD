@@ -9,7 +9,7 @@ pipeline {
                script{
 						checkout([$class: 'GitSCM',
      branches: [[name: "*/master" ]],
-     userRemoteConfigs: [[credentialsId: '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', url: 'https://github.com/yosrijendoubi/CD.git']]
+     userRemoteConfigs: [[credentialsId: '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', url: 'https://github.com/yosrijendoubi/CD.git']]
          ])
 				    }
             }
