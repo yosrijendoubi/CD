@@ -31,8 +31,6 @@ pipeline {
             }
         }
 
-    }
-
 stage('dockerHub') {
              steps{
                 script{
@@ -40,7 +38,6 @@ stage('dockerHub') {
                 }
             }
         }
-   
-    
-    
+
+    }   
 }
