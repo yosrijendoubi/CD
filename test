@@ -1,0 +1,666 @@
+function phi_ojs_build_and_send_to_sap()
+{
+	
+	// hours coming from TC and from a DA project are flagged at creation (PHI_UA_B_JUST_INTEGRATED_AND_FOR_SAP)
+	var h_actual_hours = new hashtable(\"STRING\");
+	
+	// Built table hours for SAP (based on existing hours and newly created one)
+	writetolog(\"Selecting actual hours to be treated for SAP sending...\")
+	for (var ah in \"opxWork_Performed\" where ah.PROJECT != \"\" && ah.PHI_UA_B_JUST_INTEGRATED_AND_FOR_SAP && AH.PROJECT.PHI_UF_B_FROM_DA && AH.PROJECT._WZD_AA_B_PERMANENT == false && ah.PHI_UF_B_CAN_BE_SENT_TO_SAP )
+	{	
+
+		ah.positiveonb();
+		var ah_eligible = phi_ojs_check_actual_to_send(ah);
+		
+		withoutlocking
+		{
+			if (ah.PHI_UA_S_INPUT_TYPE_CODE == \"\")
+			{
+				ah.PHI_UA_S_INPUT_TYPE_CODE = \"Standard\";
+			}
+		}
+	
+		if (!ah_eligible) continue;		
+		//we need to group hours by timesheet, act, res, input type
+		var group_id = ah.PHI_UF_S_GROUP_ID_SAP;
+		
+		//check if entry exists in hashtable
+		var v_hours = h_actual_hours.get(group_id);
+				
+		if (v_hours instanceof Vector)
+		{
+			v_hours.push(ah);
+			h_actual_hours.set(group_id,v_hours);
+		}
+		else
+		{
+			var new_v_hours = new Vector();
+			new_v_hours.push(ah);
+			h_actual_hours.set(group_id,new_v_hours);
+		}
+	
+		//unflag hours
+		withoutlocking
+		{
+			ah.PHI_UA_B_JUST_INTEGRATED_AND_FOR_SAP = false;
+		}
+	}
+	
+	// built
+	var v_tc = new Vector();
+	
+	for(var ts_group in h_actual_hours)
+	{
+		writetolog(\"Treating Timecard group => \" + ts_group)
+		var v_ah = h_actual_hours.get(ts_group);
+		var total_load = 0;		
+		
+		if (v_ah instanceof Vector)
+		{
+			var HourType =\"\";
+			var ResourceID = \"\";
+			var CostCenter = \"\"; // retrieve from traces
+			var ProjectID = \"\";     //without PJ-	 
+			var ProjectType = \"\";	 
+			var TaskID = \"\";	
+			var WeekNumber = \"\";     				
+			var Date = \"\";  
+			var CapexFlag = \"\";     				
+			var Hours = \"\";     				
+			var TimesheetID = \"\";     						
+			var CompanyCode = \"\";   
+			var SystemName = \"\";
+			var Username = \"Planisware\"; 
+			var ResourceRoleID = \"\"; // retrieved from traces				
+			var sapprojectid = \"\";     		
+			var sapwbsid = \"\";     		
+			var sapnetworkorder = \"\";	  	
+			var UnitOfMeasure = \"H\"; 
+			
+				
+			var dateFormat =\"YYYY-MM-DDTHH:MM:SS\";
+						
+			//retrieve first ah to get general information
+			var o_ah = v_ah[0];
+			var o_res = \"\";
+			var o_act = \"\";
+			var o_prj = \"\";
+			var contractual_hours = 0;
+			var tc_start_date = -1;	
+			var tc_end_date = -1;
+			var nb_days_in_tc = 0;
+			
+			var res_id = \"\";
+			var user_linked_to_res = \"\";
+			var detail_message = \"\";
+			var esp = \"get_char\".callmacro(10);
+			
+			
+			// COMMON VALUES FOR ALL LINES THAT WILL BE CREATED
+			if(o_ah instanceof opxWork_Performed)
+			{
+				o_res = o_ah.RES;
+				o_act = o_ah.ACTIVITY;
+				o_prj = o_ah.ACTIVITY.PROJECT;
+				
+				if (o_res instanceOf opxResource && o_res.printAttribute(\"ID\") != \"\" && o_act instanceOf opxActivity && o_act.printAttribute(\"ID\") != \"\" && o_prj instanceOf opxproject)
+				{
+					var tc = phi_ojs_retrieve_tc(o_ah.PHI_UA_S_TC_ID);
+
+					if (tc instanceof opxTimecard)
+					{
+						_tc_set_current_tc(tc); // force loading of tc
+						nb_days_in_tc = tc.gettccolumnsdates().length;
+						
+						tc_start_date = tc.START_DATE;
+						tc_end_date = context.callDateFormula(\"ADD_DURATION(\"+tc_start_date.sdate+\",'\"+ (nb_days_in_tc-1)+\"d',\\\"\\\")\");	
+						// contractual_hours = phi_ojs_contractual_hours(o_res,tc_start_date,tc_end_date)	
+						contractual_hours = o_res.PHI_UF_N_CONTRACTUAL_HOURS;
+					}
+					
+					detail_message +=\"------ Timecard Information ------\" + esp;
+					detail_message +=\"Timecard ID stored in Actual hours: \" + o_ah.PHI_UA_S_TC_ID + esp;
+					detail_message +=\"Start date: \" + tc_start_date + esp;
+					detail_message +=\"End date date: \" + tc_end_date + esp;
+					detail_message +=\"Contractual hours for the timesheet: \" + \"print_number\".call(contractual_hours,\"####.00\")  + esp;
+					detail_message +=\"Number of days in the Timesheet: \" + nb_days_in_tc + esp;
+					
+					
+					if (tc_start_date instanceOf Date && tc_end_date instanceOf Date)
+					{
+						HourType = o_ah.printAttribute(\"PHI_UA_S_INPUT_TYPE_CODE\").toString();
+						if ( o_ah.printAttribute(\"PHI_UA_S_INPUT_TYPE_CODE\").toString() == \"Overtime\")
+						{
+							if (o_res.PHI_UA_B_OVERTIME_PAID)
+							{
+								HourType = \"PaidOvertime\";
+							}
+							else
+							{
+								HourType = \"UnpaidOvertime\";
+							}
+						}
+						
+						ResourceID = o_res.printAttribute(\"PHI_UF_S_RESOURCE_ID\").toString();
+						var contractor = phi_ojs_get_value_from_traces(o_res,\"PHI_RA_CONTRACTOR\",tc_start_date); // retrieve from traces
+						var contractor_obj = \"opxBREAKDOWN_0\".get(contractor);
+						if (contractor_obj instanceOf opxBREAKDOWN_0 && contractor_obj.printAttribute(\"ID\") != \"\")
+						{
+							CostCenter = contractor_obj.get(\"PHI_NF_S_COST_CENTER\");
+						}
+						
+						ProjectID = o_prj.printAttribute(\"ID\").toString().replaceregexp(\"PJ-\",\"\");     //without PJ-	 
+						ProjectType = o_prj.printAttribute(\"PHI_UF_S_PROCESS_TYPE\").toString();	 
+						//TaskID = o_act.printAttribute(\\\"ONB\\\").toString();	
+						TaskID = o_act.printAttribute(\"PHI_UF_S_SAP_TASK_ID\"); // changed for September 2021 Release	
+						WeekNumber = o_ah.printAttribute(\"PHI_UF_S_WEEK_NUMBER\").toString();     				
+						Date = \"PRINT_DATE\".callmacro(tc_end_date,dateFormat);    				
+						TimesheetID = o_ah.printAttribute(\"PHI_UA_S_TC_ID\").toString();     						
+						CompanyCode = o_act.printAttribute(\"PHI_NF_S_COMPANY_CODE\").toString();   
+						SystemName = (o_act.BREAKDOWN_0.printAttribute(\"ID\") != \"\") ? o_act.BREAKDOWN_0.PHI_UA_S_SYSTEM_NAME : \"\";
+						ResourceRoleID = phi_ojs_get_value_from_traces(o_res,\"USER_ATTRIBUTE_PHI_UA_S_RESOURCE_ROLE\",tc_start_date); // retrieved from traces
+						res_id = o_res.printAttribute(\"ID\");
+						user_linked_to_res = o_res.printAttribute(\"MANAGER\");
+						
+						var interface_log_line = phi_ojs_get_interface_log_obj(o_act.printAttribute(\"ONB\").toString(),CompanyCode,context.PHI_GS_TO_SAP_TASKS)
+						if(interface_log_line != false)
+						{
+							sapprojectid = interface_log_line.PHI_UA_S_SAP_PROJECT_ID;
+							sapwbsid = interface_log_line.PHI_UA_S_SAP_WBS_ID;
+							sapnetworkorder = interface_log_line.PHI_UA_S_SAP_NETWORKORDER;
+						}
+						detail_message += esp;
+						detail_message +=\"------ Actual Hours Information ------\" + esp;
+						detail_message +=\"Activity: \" + o_act.printAttribute(\"ID\") + esp;
+						detail_message +=\"Project:  \" + o_prj.printAttribute(\"ID\") + esp;
+						detail_message +=\"Resource:  \" + res_id + esp;
+						detail_message +=\"User linked to resource:  \" + user_linked_to_res + esp;
+						detail_message +=\"ResourceID:  \" + ResourceID + esp;
+						detail_message +=\"Hour Type:  \" + HourType + esp;
+						detail_message +=\"Contractor value on \" + tc_start_date + \": \" + contractor + esp;
+						detail_message +=\"CostCenter for above contractor: \" + CostCenter + esp;
+						detail_message +=\"Project ID: \" + ProjectID + esp;
+						detail_message +=\"Project Type: \" + ProjectType + esp;
+						detail_message +=\"Task ID: \" + TaskID + esp;
+						detail_message +=\"Week Number: \" + WeekNumber + esp;
+						detail_message +=\"Last date of the Timesheet: \" + Date + esp;
+						detail_message +=\"SAP kernel (System name of the contractor of the activity): \" + SystemName + esp;
+						detail_message +=\"Resource Role ID value on \" + tc_start_date + \": \" + ResourceRoleID + esp;
+						detail_message +=\"SAP Project ID: \" + sapprojectid + esp;
+						detail_message +=\"SAP WBS ID: \" + sapwbsid + esp;
+						detail_message +=\"SAP Network Order: \" + sapnetworkorder + esp;
+						detail_message +=\"Unit of Measure: \" + UnitOfMeasure + esp;
+						detail_message +=\"Username: \" + Username + esp;
+						
+					}
+					else
+					{
+						writetolog(\"Error in function phi_ojs_integration_actual_hours with tc_start_date (\" + tc_start_date + \") or tc_end_date (\" + tc_end_date + \")\")
+						continue;
+					}
+				}
+				else
+				{
+					writetolog(\"Error in function phi_ojs_integration_actual_hours with resource (\" + o_res + \") or activity (\" + o_act + \") or project (\" + o_prj +\")\")
+					continue;
+				}
+			
+			}
+			
+			
+			
+			//calculation of CAPEX flag, depending of result, it might result to several ACTUAL SAP hours lines creation
+			var prj_elig_capex = phi_ojs_get_value_from_traces(o_prj,\"PHI_AA_B_CAPITALIZATION_OK\",tc_start_date);
+			
+			detail_message += esp;
+			detail_message +=\"------ CAPEX Calculation FLAG ------\" + esp;
+			detail_message +=\"Project Eligible For Capitalization value on \" + tc_start_date + \": \" + prj_elig_capex + esp;
+			
+			if (prj_elig_capex == \"false\" || prj_elig_capex == \"NO\")
+			{
+				CapexFlag=\"OPEX\";
+			}
+			else
+			{
+				//Project is eligble for Capitalization
+				
+				//Input type condition
+				var InputStandardCondition = (HourType == \"Standard\") ? true : false;
+				
+				//gate that are used in for capitalization controls are defined on the project type level (PHI_UA_S_CAPITALIZATION_START & PHI_UA_S_CAPITALIZATION_END)
+				var prj_type = o_prj.Project_Type;
+				var accolade_process_model = o_prj.PHI_UA_S_ACCOLADE_PROCESS_MODEL;
+				var capex_gate_start_passed = \"\";
+				var capex_gate_start_ps = \"\";
+				var capex_gate_end_passed = \"\";
+				var capex_gate_end_ps = \"\";
+				if(accolade_process_model instanceOf opx__USER_TABLE_PHI_UT_PROCESS_MODEL && accolade_process_model.printAttribute(\"ID\") != \"\")
+				{
+					var capex_gate_start = accolade_process_model.PHI_UA_S_CAPITALIZATION_START;
+					var capex_gate_end = accolade_process_model.PHI_UA_S_CAPITALIZATION_END;
+					
+					if (capex_gate_start instanceOf opxwbs_type && capex_gate_start.printAttribute(\"ID\") != \"\")
+					{
+						var onb =  capex_gate_start.printAttribute(\"ONB\").toString();
+						capex_gate_start_passed = o_prj.get(\"_PO_DA_D_GATE_DATE\" + onb + \"PASSED\");
+						capex_gate_start_ps = o_prj.get(\"_PO_DA_D_GATE_DATE\" + onb + \"PS\");				
+					}
+					else
+					{
+						writetolog(\"No capitalization start gate is defined for Accolade Process model \" + accolade_process_model)
+					}
+					
+					if (capex_gate_end instanceOf opxwbs_type && capex_gate_end.printAttribute(\"ID\") != \"\")
+					{
+						var onb =  capex_gate_end.printAttribute(\"ONB\").toString();
+						capex_gate_end_passed = o_prj.get(\"_PO_DA_D_GATE_DATE\" + onb + \"PASSED\");
+						capex_gate_end_ps = o_prj.get(\"_PO_DA_D_GATE_DATE\" + onb + \"PS\");				
+					}
+					else
+					{
+						writetolog(\"No capitalization end gate is defined for Accolade Process model \" + accolade_process_model)
+					}
+					
+					detail_message +=\"Project Type: \" + prj_type.printAttribute(\"ID\") + esp;
+					detail_message +=\"Accolade Process model: \" + accolade_process_model.printAttribute(\"ID\") + esp;
+					detail_message +=\"Capex Start Gate: \" + capex_gate_start.printAttribute(\"ID\") + esp;
+					detail_message +=\"Capex Start Gate Date: \" + capex_gate_start_ps + esp;
+					detail_message +=\"Capex Start Gate Passed: \" + capex_gate_start_passed + esp;					
+					detail_message +=\"Capex End Gate: \" + capex_gate_end.printAttribute(\"ID\") + esp;
+					detail_message +=\"Capex End Gate Date: \" + capex_gate_end_ps + esp;
+					detail_message +=\"Capex End Gate Passed: \" + capex_gate_end_passed + esp;
+					
+										
+				}
+				else
+				{
+					writetolog(\"Project type not defined for project \" + o_prj)
+				}		
+				
+				
+				//PDC-GATE status is Completed (PDC-GATE-Passed) AND The Start date of the timesheet is equal or after PDC-GATE date (Planned Start)				
+ 				var CapexGateStartCondition = (capex_gate_start_passed != \"\" && capex_gate_start_passed && capex_gate_start_ps != \"\" && capex_gate_start_ps !=-1 && tc_start_date >= capex_gate_start_ps) ? true :false;
+				
+				//RFD conditons : The Start date of the timesheet is before the RFD-GATE (Planned Start) AND RFD-GATE is  NOT completed  (RFD-GATE-Passed)				
+				var CapexGateEndCondition = (capex_gate_end_passed !=\"\" && capex_gate_end_passed == false && capex_gate_end_ps != \"\" && capex_gate_end_ps != -1 && tc_start_date < capex_gate_end_ps) ? true :false;
+								
+				//The Cost Type of the task is not set to ‘Operating’				
+				var CostTypevalue =  phi_ojs_get_value_from_traces(o_act,\"USER_ATTRIBUTE_PHI_UA_S_COST_TYPE\",tc_start_date);
+				var CostTypeCondition = (CostTypevalue != \"Operating\") ? true : false;
+				
+				
+				//Function Type of resource is eligible for capitalization
+				//we need to retrieve values traces at the start date of the timesheet
+				var FunctionTypeValue = phi_ojs_get_value_from_traces(o_res,\"USER_ATTRIBUTE_PHI_UA_S_FUNCTION_TYPE\",tc_start_date);
+				var FunctionTypeValueObj = \"opx__USER_TABLE_PHI_UT_FUNCTION_TYPE\".get(FunctionTypeValue);
+				var FunctionTypeCapexValue = false;
+				if (FunctionTypeValueObj instanceOf opx__USER_TABLE_PHI_UT_FUNCTION_TYPE && FunctionTypeValueObj.printAttribute() != \"\")
+				{
+					FunctionTypeCapexValue = phi_ojs_get_value_from_traces(FunctionTypeValueObj,\"USER_ATTRIBUTE_PHI_UA_B_ELIGIBLE_FOR_CAPEX_FUNC_TYPE\",tc_start_date);
+				}
+				var FunctionTypeCondition = (FunctionTypeValue != \"\" && (FunctionTypeCapexValue == \"true\" || FunctionTypeCapexValue == \"YES\") ) ? true : false;			
+				
+				
+				
+				//Functional Area of resource cost center is eligible for capitalization
+				var FunctionAreaContractorValue = phi_ojs_get_value_from_traces(o_res,\"PHI_RA_CONTRACTOR\",tc_start_date);
+				var FunctionAreaContractorValueObj = \"opxBREAKDOWN_0\".get(FunctionAreaContractorValue);
+				var FunctionAreaValue = \"\";
+				var FunctionAreaObj = \"\";
+				var FunctionAreaCapexValue = false;
+				if (FunctionAreaContractorValueObj instanceOf opxBREAKDOWN_0 && FunctionAreaContractorValueObj.printAttribute(\"ID\") != \"\")
+				{
+					FunctionAreaValue = phi_ojs_get_value_from_traces(FunctionAreaContractorValueObj,\"USER_ATTRIBUTE_PHI_UA_S_FUNCTIONAL_AREA\",tc_start_date);
+					
+					FunctionAreaObj = \"opx__USER_TABLE_PHI_UT_FUNCTIONAL_AREA\".get(FunctionAreaValue);
+					if (FunctionAreaObj instanceOf opx__USER_TABLE_PHI_UT_FUNCTIONAL_AREA && FunctionAreaObj.printAttribute() != \"\")
+					{
+						FunctionAreaCapexValue = phi_ojs_get_value_from_traces(FunctionAreaObj,\"USER_ATTRIBUTE_PHI_UA_B_ELIGIBLE_FOR_CAPEX_FUNC_AREA\",tc_start_date);
+					}
+					
+				}				
+				var FunctionAreaCondition =(FunctionAreaContractorValue != \"\" && FunctionAreaValue != \"\" && (FunctionAreaCapexValue==\"true\" || FunctionAreaCapexValue==\"YES\")) ? true : false;
+				// var FunctionAreaConditionhold =(FunctionAreaContractorValue != \"\" && (FunctionAreaValue == \"\" || FunctionAreaCapexValue ==\"false\" || FunctionAreaCapexValue==\"NO\")) ? true : false;
+				var FunctionAreaConditionhold =(FunctionAreaValue == \"\") ? true : false;
+				
+								
+				//CAPEX
+				if (InputStandardCondition && CapexGateStartCondition && CapexGateEndCondition && CostTypeCondition && FunctionTypeCondition && FunctionAreaCondition)
+				{
+					//CAPEX
+					CapexFlag=\"CAPEX\";					
+				}
+				else if ( InputStandardCondition==false || CapexGateStartCondition == false || CapexGateEndCondition == false || CostTypeCondition == false || FunctionTypeValue == \"\" || FunctionTypeCondition == false || FunctionAreaCondition == false )
+				{
+					//NONCAPEX
+					CapexFlag=\"NONCAPEX\";
+				}
+				else if(InputStandardCondition && CapexGateStartCondition && CapexGateEndCondition && CostTypeCondition &&  FunctionAreaConditionhold)
+				{
+					//HOLD
+					CapexFlag=\"Hold the hours\";
+				}	
+
+				detail_message +=\"(Activity) Cost type value on \" + tc_start_date + \": \" + CostTypevalue + esp;
+				detail_message +=\"(Resource) Function type value on \" + tc_start_date + \": \" + FunctionTypeValue + esp;			
+				detail_message +=\"(Resource) Function type Eligible for Capex value on \" + tc_start_date + \": \" + FunctionTypeCapexValue + esp;
+				detail_message +=\"(Resource) Contractor value on \" + tc_start_date + \": \" + FunctionAreaContractorValue + esp;
+				detail_message +=\"(Contractor) Functional Area value on \" + tc_start_date + \": \" + FunctionAreaValue + esp;
+				detail_message +=\"(Contractor) Functional Area Eligible for Capex value on \" + tc_start_date + \": \" + FunctionAreaCapexValue + esp;	
+				detail_message +=\"InputStandardCondition (Standard Hours) : \" + InputStandardCondition + esp;
+				detail_message +=\"Capex Start Gate Condition (Passed and PS <= TC_DATE) : \" + CapexGateStartCondition + esp;
+				detail_message +=\"Capex End Gate Condition (NOT Passed and PS > TC_DATE) : \" + CapexGateEndCondition + esp;
+				detail_message +=\"CostType Condition (different than Operating) : \" + CostTypeCondition + esp;
+				detail_message +=\"FunctionType Condition (Function type value not empty and Eligible for Capex) : \" + FunctionTypeCondition + esp;
+				detail_message +=\"FunctionArea Condition (Function area & functional area contractor values not empty and Eligible for Capex) : \" + FunctionAreaCondition + esp;				
+				detail_message +=\"FunctionArea Hold Condition (Functional area contractor value empty : \" + FunctionAreaConditionhold + esp;
+
+			}
+			
+			
+			
+			
+			
+			detail_message +=\"CAPEX FLAG: \" + CapexFlag + esp;
+						
+
+			// alert(\"Capex Flag => \" + CapexFlag)
+			total_load = 0;
+			//CALCULATED VALUES
+			for (var actual_hour in v_ah)
+			{
+				total_load += actual_hour.total_load * 8; // Number hours a day
+			}
+			// alert(\"total load \" + total_load)
+			Hours = \"print_number\".call(total_load,\"####.00\");  //because resource unit is Day	
+						
+					
+			
+			//creation of Actual Hours SAP
+			var name_ah = ts_group + CapexFlag;
+			
+			var sap_ah = \"opx__USER_TABLE_PHI_UT_HOURS_FOR_SAP\".get(name_ah);
+			
+			var newly_capex= false;
+			if(CapexFlag ==\"CAPEX\")
+			{
+				newly_capex = true;
+			}
+			
+			var send_hours= true;
+			if(CapexFlag ==\"Hold the hours\")
+			{
+				send_hours = false;
+			}
+			
+			//existing line, so correction of timesheet
+			if (sap_ah instanceOf opx__USER_TABLE_PHI_UT_HOURS_FOR_SAP && sap_ah.printattribute(\"ID\") != \"\" )
+			{
+				//in case of correction we received the delta (that's the input in TC, negative or positive values)
+				//we need to send the existing line with negative value (correction in SAP) and send the new value calculated (not the delta set in TC)
+				
+				//send new calculated value
+				// new value is retrieved from existing line (and for capex if there is a split, on child also)
+				var new_hours = sap_ah.PHI_UF_N_SUM_OF_HOURS + Hours.ParseNumber();
+
+                         
+         
+				
+				if(new_hours == 0)
+				{
+					send_hours = false;
+				}
+				
+				phi_ojs_create_opposite_line(sap_ah);
+				//create opposite line for the line and also potentially for NONCAPEX lines created from CAPEX split
+				for (var child in sap_ah.get(\"CHILDREN\"))
+				{
+					phi_ojs_create_opposite_line(child);
+					child.NAME = child.NAME + \"Old\";
+				}
+				
+				//rename old line, so not counted next time
+				sap_ah.NAME = sap_ah.NAME + \"Old\";
+				
+				
+				//detail message information
+				detail_message += esp;
+				detail_message +=\"------ Actual hours for SAP Information Correction Case ------\" + esp;
+				detail_message +=\"Hours entered in TC for the grouping Timesheet, activity, resource, input type (before potential split) : \" + Hours + esp;
+				detail_message +=\"Recalculated hours (existing hours + delta)(before potential split): \" + \"print_number\".call(new_hours,\"####.00\") + esp;
+
+				
+				//if capex split needed it will be taken into account later
+				sap_ah = new opx__USER_TABLE_PHI_UT_HOURS_FOR_SAP (	\"NAME\",name_ah, //OK
+																	\"DESC\",\"\", // OK
+																	\"PHI_UA_S_CAPEXFLAG\",CapexFlag, 
+																	\"PHI_UA_S_COMPANYCODE\",CompanyCode, // OK
+																	\"PHI_UA_S_COSTCENTER\",CostCenter, // OK
+																	\"PHI_UA_S_DATE\",Date, //OK
+																	\"PHI_UA_S_HOURS\",\"print_number\".call(new_hours,\"####.00\"),
+																	\"PHI_UA_S_HOUR_TYPE\",HourType, //OK
+																	\"PHI_UA_S_PROJECTID\",ProjectID, // OK
+																	\"PHI_UA_S_PROJECTTYPE\",ProjectType, //OK
+																	\"PHI_UA_S_RESOURCEID\",ResourceID, //OK
+																	\"PHI_UA_S_RESOURCEROLEID\",ResourceRoleID, // OK
+																	\"PHI_UA_S_SAPNETWORKORDER\",sapnetworkorder, //OK
+																	\"PHI_UA_S_SAPPROJECTID\",sapprojectid,//OK
+																	\"PHI_UA_S_SAPWBSID\",sapwbsid, //OK
+																	\"PHI_UA_S_SYSTEMNAME\",SystemName, //OK
+																	\"PHI_UA_S_TASKID\",TaskID, //OK
+																	\"PHI_UA_S_TIMESHEETID\",TimesheetID, //OK
+																	\"PHI_UA_S_UNITOFMEASURE\",UnitOfMeasure, //OK
+																	\"PHI_UA_S_USERNAME\",Username, //OK
+																	\"PHI_UA_S_WEEKNUMBER\",WeekNumber, //OK
+																	\"PHI_UA_B_SEND_HOURS_SAP\",send_hours,
+																	\"PHI_UA_N_TC_NB_DAYS\",nb_days_in_tc,
+																	\"PHI_UA_N_CONTRACT_HOUR_WEEK\",contractual_hours,
+																	\"PHI_UA_N_ORIGINAL_HOURS_IN_TC\",Hours,
+																	\"PHI_UA_B_NEWLY_CAPEX\",newly_capex,
+																	\"PHI_UA_S_RESOURCE\",res_id,
+																	\"PHI_UA_S_USER_LINKED_TO_RES\",user_linked_to_res,
+																	\"PHI_UA_T_MESSAGE_DETAIL\",detail_message,
+																	\"FILE\",o_prj
+																)
+						
+			}
+			else 
+			{
+				if(total_load == 0)
+				{
+					send_hours = false;
+				}
+				
+				//detail message information
+				detail_message += esp;				
+				detail_message +=\"Hours entered in TC for the grouping Timesheet, activity, resource, input type (before potential split): \" + Hours + esp;
+				// new line, no correction in timesheet
+				sap_ah = new opx__USER_TABLE_PHI_UT_HOURS_FOR_SAP (	\"NAME\",name_ah, //OK
+																	\"DESC\",\"\", // OK
+																	\"PHI_UA_S_CAPEXFLAG\",CapexFlag, 
+																	\"PHI_UA_S_COMPANYCODE\",CompanyCode, // OK
+																	\"PHI_UA_S_COSTCENTER\",CostCenter, // OK
+																	\"PHI_UA_S_DATE\",Date, //OK
+																	\"PHI_UA_S_HOURS\",Hours,
+																	\"PHI_UA_S_HOUR_TYPE\",HourType, //OK
+																	\"PHI_UA_S_PROJECTID\",ProjectID, // OK
+																	\"PHI_UA_S_PROJECTTYPE\",ProjectType, //OK
+																	\"PHI_UA_S_RESOURCEID\",ResourceID, //OK
+																	\"PHI_UA_S_RESOURCEROLEID\",ResourceRoleID, // OK
+																	\"PHI_UA_S_SAPNETWORKORDER\",sapnetworkorder, //OK
+																	\"PHI_UA_S_SAPPROJECTID\",sapprojectid,//OK
+																	\"PHI_UA_S_SAPWBSID\",sapwbsid, //OK
+																	\"PHI_UA_S_SYSTEMNAME\",SystemName, //OK
+																	\"PHI_UA_S_TASKID\",TaskID, //OK
+																	\"PHI_UA_S_TIMESHEETID\",TimesheetID, //OK
+																	\"PHI_UA_S_UNITOFMEASURE\",UnitOfMeasure, //OK
+																	\"PHI_UA_S_USERNAME\",Username, //OK
+																	\"PHI_UA_S_WEEKNUMBER\",WeekNumber, //OK
+																	\"PHI_UA_B_SEND_HOURS_SAP\",send_hours,
+																	\"PHI_UA_N_TC_NB_DAYS\",nb_days_in_tc,
+																	\"PHI_UA_N_CONTRACT_HOUR_WEEK\",contractual_hours,
+																	\"PHI_UA_N_ORIGINAL_HOURS_IN_TC\",Hours,
+																	\"PHI_UA_B_NEWLY_CAPEX\",newly_capex,
+																	\"PHI_UA_S_RESOURCE\",res_id,
+																	\"PHI_UA_S_USER_LINKED_TO_RES\",user_linked_to_res,
+																	\"PHI_UA_T_MESSAGE_DETAIL\",detail_message,
+																	\"FILE\",o_prj
+																)
+			}
+			
+			v_tc.push(TimesheetID);
+			
+			
+		}
+	}
+
+	var capex_lines = new Vector();
+	v_tc = v_tc.removeduplicates();
+	
+	for(var tc in v_tc)
+	{
+		for(var capex_line in \"opx__USER_TABLE_PHI_UT_HOURS_FOR_SAP\" where capex_line.PHI_UA_S_TIMESHEETID == tc && capex_line.PHI_UA_S_CAPEXFLAG == \"CAPEX\" && capex_line.PHI_UA_B_NEWLY_CAPEX )
+		{
+			capex_line.PHI_UA_B_NEWLY_CAPEX = false;
+			capex_lines.push(capex_line);
+			
+		}	
+	}
+	
+	
+	//we need to split CAPEX line for those needed, we need to do it now, because we need the sum on the timesheet level
+	for (var capex_line in capex_lines)
+	{
+
+		var tc_capex_hours = capex_line.PHI_UF_N_TC_CAPEX_HOURS;
+		var nb_days_in_tc = capex_line.PHI_UA_N_TC_NB_DAYS;
+		var total_load = capex_line.PHI_UA_S_HOURS.ParseNumber();
+		var contractual_hours = capex_line.PHI_UA_N_CONTRACT_HOUR_WEEK;
+
+		var esp = \"get_char\".callmacro(10);
+		var detail_message =\"------ CAPEX Split ? ------\" + esp;
+		detail_message +=\"Capex hours in the Timesheet : \" + tc_capex_hours + esp;
+		detail_message +=\"Number of days in the timesheet : \" + nb_days_in_tc + esp;
+		detail_message +=\"Hours to be originally sent : \" + total_load + esp;
+		detail_message +=\"Contractual hours for the Timesheet : \" + \"print_number\".call(contractual_hours,\"####.00\")  + esp;
+
+			
+		//amount of capitalizable hours in timesheet exceeds the (fractional) contractual hours
+		if (tc_capex_hours > (nb_days_in_tc*contractual_hours/7))
+		{
+			//need to split the hours in two (some are CAPEX and the rest NONCAPEX)			 
+			var capex_hours = (total_load * nb_days_in_tc * contractual_hours)/(7*tc_capex_hours)
+			var noncapex_hours =  total_load - capex_hours;
+
+			capex_hours = \"print_number\".call(capex_hours,\"####.00\");
+			noncapex_hours = \"print_number\".call(noncapex_hours,\"####.00\");
+			
+			//we modify the existing CAPEX, that is now split
+			capex_line.PHI_UA_S_HOURS = capex_hours.toString();
+			
+			detail_message +=\"Capex Split Required? : YES\" + esp;
+			detail_message +=\"Number of hours in the timesheet : \" + nb_days_in_tc + esp;
+			detail_message +=\"Hours to be originally sent : \" + total_load + esp;
+			detail_message +=\"Contractual hours for the Timesheet : \" + contractual_hours + esp;
+			detail_message +=\"Calculated CAPEX hours : \" + capex_hours + esp;
+			detail_message +=\"Calculated NONCAPEX hours : \" + noncapex_hours + esp;
+			
+			capex_line.PHI_UA_T_MESSAGE_DETAIL += detail_message;			
+			
+			//create a new NONCAPEX line and link it to the CAPEX one
+			var plist = new Vector()
+			plist.push(\"NAME\");
+			plist.push(capex_line.NAME.replaceregexp(\"CAPEX\",\"NONCAPEX\"));
+			plist.push(\"PHI_UT_HOURS_FOR_SAP\");
+			plist.push(capex_line);
+			plist.push(\"PHI_UA_S_CAPEXFLAG\");
+			plist.push(\"NONCAPEX\");
+			plist.push(\"PHI_UA_S_HOURS\");
+			plist.push(noncapex_hours.toString());
+			plist.push(\"PHI_UA_T_MESSAGE_DETAIL\");
+			plist.push(capex_line.PHI_UA_T_MESSAGE_DETAIL + esp + \"LINE COMING FROM A CAPEX SPLIT\");
+			var NewactualSAPline = capex_line.copywithplist(plist);
+		}
+		else
+		{
+			detail_message +=\"Capex Split Required? : NO\" + esp;
+		}
+		
+		capex_line.PHI_UA_T_MESSAGE_DETAIL += detail_message;
+		
+	}		
+	
+	writetolog(\"Creation of SAP actuals line over\")
+	//at this stage, all actuals lines are correctly created and ready to be sent to SAP
+
+
+	//cleaning hashtable
+	h_actual_hours.clear();
+	
+	//send this actual SAP hours to SAP
+	//for onePo, we need to send one message containing only the same system name (SAP kernel)
+		
+	var sys_name = \"\";
+	var sap_actual = new Vector();
+	for(var sap_line in \"opx__USER_TABLE_PHI_UT_HOURS_FOR_SAP\" where sap_line.PHI_UA_B_SEND_HOURS_SAP order by {\"PHI_UA_S_SYSTEMNAME\"})
+	{
+		//first check if all mandatory filled are field
+		if (sap_line. == false)
+		{
+			//trigger error and leave the hours for further correction, it will be retaken in the next batch run
+			var ErrorDesc = \"An error has occured. Actual hours for SAP (onb \" + sap_line.printAttribute(\"ONB\") + \") have not been sent to SAP because folliwing field are empty : \" + sap_line.PHI_UF_S_SAP_HOURS_MISSING_FIELDS;						
+			writetolog(ErrorDesc);
+			
+			//create entry in interface overview table as Fail			
+			var company_code = sap_line.printAttribute(\"PHI_UA_S_COMPANYCODE\").toString();
+			phi_ojs_create_update_entry_interface_overview(sap_line.printAttribute(\"ONB\"),company_code,context.PHI_GS_TO_SAP_HOURS,\"Fail\",new Date(),false,ErrorDesc,sys_name);
+			var event_date= new date();			
+			var precise_date = PHI_JS_GET_YYYYMMDDHHMMSS_NOW_DATE(event_date);
+			var ErrorLogName = \"Export \"+precise_date+\" for hour \"+ sap_line.ONB;
+			//create entry in interface details table
+			phi_ojs_InterfaceCreateErrorLog (context.PHI_GS_TO_SAP_HOURS,sap_line.FILE,ErrorLogName,ErrorDesc,ErrorDesc,event_date,precise_date,\"INS\",\"Failed\",\"\");
+			
+			continue;
+		}
+
+		//first one or change of System name
+		if(sys_name != sap_line.PHI_UA_S_SYSTEMNAME)
+		{
+			if (sys_name != \"\" ) 
+			{
+				if (sap_actual.length >0)
+				{
+					writetolog(\"Sending of SAP actuals lines for SAP system \" + sys_name)					
+					PHI_OJS_SEND_HOURS_TO_SAP(sap_actual);
+				}
+				else
+				{
+					alert(\"No actuals to send to SAP for system \" + sys_name)
+				}PHI_UF_B_SAP_HOURS_ALL_FIELDS_FILLED
+			}
+			
+			
+			//restart new vector of actual
+			sap_actual = new Vector();
+		}
+		
+		sys_name = sap_line.PHI_UA_S_SYSTEMNAME;
+		sap_line.positiveonb();
+		sap_actual.push(sap_line);
+		
+		withoutlocking
+		{
+			sap_line.PHI_UA_B_SEND_HOURS_SAP = false;
+		}
+	}
+	
+	if (sap_actual.length >0)
+	{
+		writetolog(\"Sending of SAP actuals lines for SAP system \" + sys_name)					
+		PHI_OJS_SEND_HOURS_TO_SAP(sap_actual);
+	}
+	else
+	{
+		alert(\"No actuals to send to SAP for system \" + sys_name)
+	}	
+}
